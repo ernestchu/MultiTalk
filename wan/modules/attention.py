@@ -280,6 +280,8 @@ class SingleStreamAttention(nn.Module):
         return x
 
 class SingleStreamMutiAttention(SingleStreamAttention):
+    # This class extends SingleStreamAttention to handle multiple speakers by using
+    # Label Rotary Position Embedding (L-RoPE), as described in the MultiTalk paper.
     def __init__(
         self,
         dim: int,
@@ -305,12 +307,18 @@ class SingleStreamMutiAttention(SingleStreamAttention):
             proj_drop=proj_drop,
             eps=eps,
         )
+        # The interval used to define the range of labels for each person.
         self.class_interval = class_interval
+        # The total range of class labels available.
         self.class_range = class_range
+        # Defines the label range for the first person (e.g., 0-4).
         self.rope_h1  = (0, self.class_interval)
+        # Defines the label range for the second person (e.g., 20-24).
         self.rope_h2  = (self.class_range - self.class_interval, self.class_range)
+        # Defines the label for the background, positioned in the middle of the total range.
         self.rope_bak = int(self.class_range // 2)
 
+        # Initialize the 1D Rotary Positional Embedding module.
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
     def forward(self, 
@@ -320,66 +328,100 @@ class SingleStreamMutiAttention(SingleStreamAttention):
                 x_ref_attn_map=None,
                 human_num=None) -> torch.Tensor:
         
+        # Remove the batch dimension from encoder_hidden_states if it's 1.
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
+        # If there is only one person, use the standard attention mechanism from the parent class.
         if human_num == 1:
             return super().forward(x, encoder_hidden_states, shape)
 
+        # Unpack shape tuple.
         N_t, _, _ = shape 
+        # Reshape the input tensor to combine batch and temporal dimensions.
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t) 
 
         # get q for hidden_state
         B, N, C = x.shape
+        # Linearly project the input to get the query vector 'q'.
         q = self.q_linear(x) 
+        # Reshape 'q' to separate heads and head dimensions.
         q_shape = (B, N, self.num_heads, self.head_dim) 
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
+        # Apply layer normalization to 'q' if enabled.
         if self.qk_norm:
             q = self.q_norm(q)
 
   
+        # --- Adaptive Person Localization using x_ref_attn_map ---
+        # The x_ref_attn_map contains similarity scores between video latents and reference image subjects.
+        # Find the max and min values in the attention map for normalization.
         max_values = x_ref_attn_map.max(1).values[:, None, None] 
         min_values = x_ref_attn_map.min(1).values[:, None, None] 
         max_min_values = torch.cat([max_values, min_values], dim=2)
 
+        # Get the global max and min values for each person's attention map.
         human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
         human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
 
+        # Normalize and scale the attention map for each person to their designated label range (L-RoPE).
         human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
         human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
+        # Create a tensor for the background with the predefined background label.
         back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
+        # Determine the most likely category (person1, person2, or background) for each token.
         max_indices = x_ref_attn_map.argmax(dim=0)
+        # Stack the normalized maps for easy indexing.
         normalized_map = torch.stack([human1, human2, back], dim=1)
+        # Assign the final label to each token based on the most likely category.
         normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
 
+        # --- Apply L-RoPE to Query (q) ---
+        # Reshape q to apply rotary embeddings.
         q = rearrange(q, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
+        # Apply the calculated positional embeddings (labels) to the query.
         q = self.rope_1d(q, normalized_pos)
+        # Reshape q back to its original shape.
         q = rearrange(q, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
+        # --- Prepare Key (k) and Value (v) from Audio Embeddings ---
         _, N_a, _ = encoder_hidden_states.shape 
+        # Linearly project the audio embeddings to get key and value.
         encoder_kv = self.kv_linear(encoder_hidden_states) 
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
         encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
         encoder_k, encoder_v = encoder_kv.unbind(0) 
 
+        # Apply layer normalization to 'k' if enabled.
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
         
+        # --- Apply L-RoPE to Key (k) ---
+        # Create a label for each audio frame. The first half of the audio corresponds to person 1, the second half to person 2.
         per_frame = torch.zeros(N_a, dtype=encoder_k.dtype).to(encoder_k.device)
-        per_frame[:per_frame.size(0)//2] = (self.rope_h1[0] + self.rope_h1[1]) / 2
-        per_frame[per_frame.size(0)//2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
+        per_frame[:per_frame.size(0)//2] = (self.rope_h1[0] + self.rope_h1[1]) / 2 # Center of person 1's label range
+        per_frame[per_frame.size(0)//2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2 # Center of person 2's label range
+        # Create the full positional encoding for the audio keys.
         encoder_pos = torch.concat([per_frame]*N_t, dim=0)
+        # Reshape k to apply rotary embeddings.
         encoder_k = rearrange(encoder_k, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
+        # Apply the positional embeddings (labels) to the key.
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
+        # Reshape k back to its original shape.
         encoder_k = rearrange(encoder_k, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
  
+        # --- Attention Calculation ---
+        # Reshape q, k, v for the attention function.
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+        # Compute memory-efficient attention. Because q and k have been modified with L-RoPE,
+        # the attention will now correctly bind each audio stream to the corresponding person.
         x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
         x = rearrange(x, "B M H K -> B H M K")
 
+        # --- Output Projection ---
         # linear transform
         x_output_shape = (B, N, C)
         x = x.transpose(1, 2) 
