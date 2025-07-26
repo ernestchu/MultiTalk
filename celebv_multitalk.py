@@ -31,6 +31,10 @@ from einops import rearrange
 import soundfile as sf
 import re
 
+import io
+from datasets import load_dataset
+import torchvision
+import soundfile as sf
 
 def _validate_args(args):
     # Basic check
@@ -79,6 +83,12 @@ def _parse_args():
         type=int,
         default=81,
         help="How many frames to be generated in one clip. The number should be 4n+1"
+    )
+    parser.add_argument(
+        "--max_frame_num",
+        type=int,
+        default=81,
+        help="How many frames to be generated in total"
     )
     parser.add_argument(
         "--ckpt_dir",
@@ -526,9 +536,34 @@ def generate(args):
     # read input files
 
     
+    duration = 5  # seconds
+    num_samples = 20
+    num_skiped_samples = 0
+    ds_url = "https://huggingface.co/datasets/SwayStar123/CelebV-HQ/resolve/main/videos.tar"
+    for i, data in enumerate(load_dataset("webdataset", data_files={"train": ds_url}, split="train", streaming=True)):
+        i -= num_skiped_samples
+        if i == num_samples:
+            break
+        video, audio, meta = torchvision.io.read_video(io.BytesIO(data['mp4']), pts_unit='sec')
+        if 'audio_fps' not in meta or audio.size(1) < duration * meta['audio_fps']:
+            num_skiped_samples += 1
+            continue
 
-    with open(args.input_json, 'r', encoding='utf-8') as f:
-        input_data = json.load(f)
+        tmp_dir = '/tmp/multitalk-celeb'
+        if rank == 0:
+            os.makedirs(tmp_dir, exist_ok=True)
+            sf.write(os.path.join(tmp_dir, 'audio.wav'), audio.numpy().T, meta['audio_fps'])
+            Image.fromarray(video[0].numpy()).save(os.path.join(tmp_dir, 'image.png'))
+
+        dist.barrier()
+
+        input_data = {
+            'prompt': 'A person talking.',
+            'cond_image': os.path.join(tmp_dir, 'image.png'),
+            'cond_audio': {
+                'person1': os.path.join(tmp_dir, 'audio.wav'),
+            },
+        }
         
         wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
         args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
@@ -578,57 +613,59 @@ def generate(args):
                 input_data['video_audio'] = sum_audio
 
 
-    logging.info("Creating MultiTalk pipeline.")
-    wan_i2v = wan.MultiTalkPipeline(
-        config=cfg,
-        checkpoint_dir=args.ckpt_dir,
-        quant_dir=args.quant_dir,
-        device_id=device,
-        rank=rank,
-        t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp, 
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
-        t5_cpu=args.t5_cpu,
-        lora_dir=args.lora_dir,
-        lora_scales=args.lora_scale,
-        quant=args.quant
-    )
-
-
-    if args.num_persistent_param_in_dit is not None:
-        wan_i2v.vram_management = True
-        wan_i2v.enable_vram_management(
-            num_persistent_param_in_dit=args.num_persistent_param_in_dit
+        logging.info("Creating MultiTalk pipeline.")
+        wan_i2v = wan.MultiTalkPipeline(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            quant_dir=args.quant_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp, 
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
+            t5_cpu=args.t5_cpu,
+            lora_dir=args.lora_dir,
+            lora_scales=args.lora_scale,
+            quant=args.quant
         )
-    
-    logging.info("Generating video ...")
-    video = wan_i2v.generate(
-        input_data,
-        size_buckget=args.size,
-        motion_frame=args.motion_frame,
-        frame_num=args.frame_num,
-        shift=args.sample_shift,
-        sampling_steps=args.sample_steps,
-        text_guide_scale=args.sample_text_guide_scale,
-        audio_guide_scale=args.sample_audio_guide_scale,
-        seed=args.base_seed,
-        offload_model=args.offload_model,
-        max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
-        color_correction_strength = args.color_correction_strength,
-        extra_args=args,
-        )
-    
 
-    if rank == 0:
+
+        if args.num_persistent_param_in_dit is not None:
+            wan_i2v.vram_management = True
+            wan_i2v.enable_vram_management(
+                num_persistent_param_in_dit=args.num_persistent_param_in_dit
+            )
         
-        if args.save_file is None:
-            formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/",
-                                                                        "_")[:50]
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
+        logging.info("Generating video ...")
+        video = wan_i2v.generate(
+            input_data,
+            size_buckget=args.size,
+            motion_frame=args.motion_frame,
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            sampling_steps=args.sample_steps,
+            text_guide_scale=args.sample_text_guide_scale,
+            audio_guide_scale=args.sample_audio_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model,
+            max_frames_num=args.max_frame_num if args.mode == 'clip' else 1000,
+            color_correction_strength = args.color_correction_strength,
+            extra_args=args,
+            )
         
-        logging.info(f"Saving generated video to {args.save_file}.mp4")
-        save_video_ffmpeg(video, args.save_file, [input_data['video_audio']], high_quality_save=False)
+
+        if rank == 0:
+            
+            if args.save_file is None:
+                formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/",
+                                                                            "_")[:50]
+                args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
+            
+            os.makedirs(args.save_file, exist_ok=True)
+            save_name = os.path.join(args.save_file, f"video_{i:02}.mp4")
+            logging.info(f"Saving generated video to {save_name}")
+            save_video_ffmpeg(video, save_name, [input_data['video_audio']], high_quality_save=False)
         
     logging.info("Finished.")
 
