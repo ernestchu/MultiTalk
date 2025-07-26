@@ -555,7 +555,8 @@ def generate(args):
             sf.write(os.path.join(tmp_dir, 'audio.wav'), audio.numpy().T, meta['audio_fps'])
             Image.fromarray(video[0].numpy()).save(os.path.join(tmp_dir, 'image.png'))
 
-        dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
 
         input_data = {
             'prompt': 'A person talking.',
@@ -663,7 +664,7 @@ def generate(args):
                 args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
             
             os.makedirs(args.save_file, exist_ok=True)
-            save_name = os.path.join(args.save_file, f"video_{i:02}.mp4")
+            save_name = os.path.join(args.save_file, f"video_{i:02}")
             logging.info(f"Saving generated video to {save_name}")
             save_video_ffmpeg(video, save_name, [input_data['video_audio']], high_quality_save=False)
         
